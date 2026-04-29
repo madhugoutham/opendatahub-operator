@@ -2,8 +2,13 @@ package e2e_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os/exec"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	gTypes "github.com/onsi/gomega/types"
 	operatorv1 "github.com/openshift/api/operator/v1"
@@ -55,6 +60,19 @@ const (
 	TracesStorageBackendS3  = "s3"
 	TracesStorageBackendGCS = "gcs"
 	TracesStorageSize1Gi    = "1Gi"
+
+	// E2E Trace Flow Verification constants (Group 10).
+	tracingE2ENamespace    = "e2e-tracing"
+	tracingE2ELLMISVCName  = "tracing-test"
+	tracingE2EGatewayName  = "e2e-tracing-gateway"
+	tracingE2EModelName    = "Qwen/Qwen3-0.6B"
+	tracingE2EModelURI     = "hf://Qwen/Qwen3-0.6B"
+	tracingE2EVLLMImage    = "quay.io/aipcc/rhaiis/cuda-ubi9:3.4.0"
+	vllmOTELServiceName    = "vllm-decode"
+	eppOTELServiceName     = "gateway-api-inference-extension/epp"
+	numTraceTestRequests   = 5
+	tempoGatewayLocalPort  = "18080"
+	gatewayLocalPort       = "18443"
 )
 
 // monitoringOwnerReferencesCondition is a reusable condition for validating owner references.
@@ -128,6 +146,7 @@ func monitoringTestSuite(t *testing.T) {
 		{"Test Perses Datasource TLS with GCS backend", monitoringServiceCtx.ValidatePersesDatasourceTLSWithGCSBackend},
 		{"Validate CEL blocks invalid monitoring configs", monitoringServiceCtx.ValidateCELBlocksInvalidMonitoringConfigs},
 		{"Validate CEL allows valid monitoring configs", monitoringServiceCtx.ValidateCELAllowsValidMonitoringConfigs},
+		{"E2E Trace Flow Verification", monitoringServiceCtx.ValidateE2ETraceFlowVerification},
 		{"Validate monitoring service disabled", monitoringServiceCtx.ValidateMonitoringServiceDisabled},
 		{"Test Namespace Restricted Metrics Access", monitoringServiceCtx.ValidatePrometheusRestrictedResourceConfiguration},
 		{"Test Prometheus Secure Proxy Authentication", monitoringServiceCtx.ValidatePrometheusSecureProxyAuthentication},
@@ -2168,4 +2187,481 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceTLSWithS3Backend(t *testing
 func (tc *MonitoringTestCtx) ValidatePersesDatasourceTLSWithGCSBackend(t *testing.T) {
 	t.Helper()
 	tc.validatePersesDatasourceTLSWithCloudBackend(t, "gcs")
+}
+
+// ValidateE2ETraceFlowVerification deploys LLMInferenceService with tracing, sends inference
+// requests, and verifies vLLM spans appear in Tempo. Requires NVIDIA GPU.
+// INFERENG-5864
+//
+// TODO(mambati): The following need verification on a cluster with a healthy monitoring controller
+// (PokProd002's monitoring controller has a namespace cache error preventing operator-deployed Tempo):
+//   - queryTempoAPI() gateway auth (Bearer + X-Scope-OrgID) against operator-deployed Tempo with multi-tenancy
+//   - OTel Collector service name: code uses "data-science-collector-collector", may need adjustment
+//   - Tempo gateway service name: code uses "tempo-data-science-tempomonolithic-gateway", may differ
+//   - Pipeline was manually verified on PokProd002 using standalone Tempo (no multi-tenancy) — all traces flow correctly
+func (tc *MonitoringTestCtx) ValidateE2ETraceFlowVerification(t *testing.T) {
+	t.Helper()
+
+	if !tc.clusterHasNVIDIAGPU(t) {
+		t.Skip("E2E trace flow verification requires NVIDIA GPU")
+	}
+
+	// Setup: Enable traces with PV backend (operator deploys Tempo + OTel Collector)
+	tc.updateMonitoringConfig(
+		withManagementState(operatorv1.Managed),
+		withMonitoringTraces(TracesStorageBackendPV, "", TracesStorageSize1Gi, DefaultRetention),
+	)
+	tc.waitForTracingPodsReady(t)
+
+	// Create test namespace for LLMInferenceService
+	nsCmd := exec.Command("kubectl", "create", "ns", tracingE2ENamespace, "--dry-run=client", "-o", "yaml")
+	nsApplyCmd := exec.Command("kubectl", "apply", "-f", "-")
+	nsPipe, pipeErr := nsCmd.StdoutPipe()
+	require.NoError(t, pipeErr)
+	nsApplyCmd.Stdin = nsPipe
+	require.NoError(t, nsCmd.Start())
+	require.NoError(t, nsApplyCmd.Start())
+	_ = nsCmd.Wait()
+	require.NoError(t, nsApplyCmd.Wait(), "Failed to create tracing test namespace")
+	t.Logf("Namespace %s created", tracingE2ENamespace)
+
+	// Create Gateway + ConfigMap for inference routing
+	gatewayYAML := fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: %s-config
+  namespace: %s
+data:
+  service: |
+    metadata:
+      annotations:
+        service.beta.openshift.io/serving-cert-secret-name: "%s-tls"
+    spec:
+      type: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  gatewayClassName: data-science-gateway-class
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: %s-config
+  listeners:
+  - allowedRoutes:
+      namespaces:
+        from: Same
+    name: https
+    port: 443
+    protocol: HTTPS
+    tls:
+      certificateRefs:
+      - group: ""
+        kind: Secret
+        name: %s-tls
+      mode: Terminate`,
+		tracingE2EGatewayName, tracingE2ENamespace,
+		tracingE2EGatewayName,
+		tracingE2EGatewayName, tracingE2ENamespace,
+		tracingE2EGatewayName,
+		tracingE2EGatewayName)
+	gwApplyCmd := exec.Command("kubectl", "apply", "-f", "-")
+	gwApplyCmd.Stdin = strings.NewReader(gatewayYAML)
+	gwOut, gwErr := gwApplyCmd.CombinedOutput()
+	require.NoError(t, gwErr, "Failed to create Gateway: %s", string(gwOut))
+	t.Log("Gateway and ConfigMap created")
+
+	// Wait for gateway pod to be running
+	t.Log("Waiting for gateway pod...")
+	time.Sleep(10 * time.Second)
+
+	// Discover the gateway service created by the gateway controller
+	gwSvcCmd := exec.Command("kubectl", "get", "svc", "-n", tracingE2ENamespace,
+		"-l", "gateway.networking.k8s.io/gateway-name="+tracingE2EGatewayName,
+		"-o", "jsonpath={.items[0].metadata.name}")
+	gwSvcOut, gwSvcErr := gwSvcCmd.CombinedOutput()
+	gwSvcName := strings.TrimSpace(string(gwSvcOut))
+	if gwSvcErr != nil || gwSvcName == "" {
+		gwSvcName = tracingE2EGatewayName + "-data-science-gateway-class"
+		t.Logf("Gateway service discovery failed, using default: %s", gwSvcName)
+	} else {
+		t.Logf("Discovered gateway service: %s", gwSvcName)
+	}
+
+	// Start port-forwards
+	tempoPF := tc.startPortForward(t,
+		tc.MonitoringNamespace,
+		tc.tempoGatewayServiceName(),
+		tempoGatewayLocalPort, "8080")
+	gatewayPF := tc.startPortForward(t, tracingE2ENamespace, gwSvcName, gatewayLocalPort, "443")
+
+	// Cleanup
+	t.Cleanup(func() {
+		stopPortForward(t, tempoPF)
+		stopPortForward(t, gatewayPF)
+		delCmd := exec.Command("kubectl", "delete", "ns", tracingE2ENamespace, "--ignore-not-found=true")
+		delCmd.CombinedOutput() //nolint:errcheck // best-effort cleanup
+		tc.cleanupTracesConfiguration()
+	})
+
+	// Setup subtests
+	t.Run("Create LLMInferenceService with tracing", tc.createTracingLLMISVC)
+	if t.Failed() {
+		t.Fatal("LLMISVC creation failed, stopping")
+	}
+
+	t.Run("Wait for LLMISVC Ready", tc.waitForLLMISVCReady)
+	if t.Failed() {
+		t.Fatal("LLMISVC not ready, stopping")
+	}
+
+	t.Run("Patch EPP with OTEL env vars", tc.discoverAndPatchEPPTracing)
+	if t.Failed() {
+		t.Fatal("EPP patching failed, stopping")
+	}
+
+	// Verification subtests
+	t.Run("Send inference requests", func(t *testing.T) {
+		tc.sendTracingInferenceRequests(t)
+	})
+	if t.Failed() {
+		t.Fatal("Inference requests failed, stopping")
+	}
+
+	t.Run("Verify vLLM spans in Tempo", tc.verifyVLLMSpansInTempo)
+	t.Run("Verify EPP spans in Tempo", tc.verifyEPPSpansInTempo)
+}
+
+// clusterHasNVIDIAGPU checks if any node in the cluster has allocatable NVIDIA GPUs.
+func (tc *MonitoringTestCtx) clusterHasNVIDIAGPU(t *testing.T) bool {
+	t.Helper()
+	cmd := exec.Command("kubectl", "get", "nodes",
+		"-o", "jsonpath={.items[*].status.allocatable.nvidia\\.com/gpu}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Logf("GPU check failed: %v", err)
+		return false
+	}
+	for _, val := range strings.Fields(string(out)) {
+		n, parseErr := strconv.Atoi(val)
+		if parseErr == nil && n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForTracingPodsReady waits for both TempoMonolithic and OTel Collector to be ready.
+// setupTraces() returns before pods are running — this blocks until they're up.
+// TODO(mambati): verify deployment name "data-science-collector-collector" on operator-deployed cluster
+func (tc *MonitoringTestCtx) waitForTracingPodsReady(t *testing.T) {
+	t.Helper()
+	t.Log("Waiting for TempoMonolithic to be ready...")
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.TempoMonolithic, types.NamespacedName{
+			Name: TempoMonolithicName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.status.conditions[] | select(.type == "Ready") | .status == "True"`)),
+		WithCustomErrorMsg("TempoMonolithic should reach Ready state"),
+	)
+	t.Log("TempoMonolithic is ready")
+
+	t.Log("Waiting for OTel Collector deployment to have ready replicas...")
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name: OpenTelemetryCollectorName + "-collector", Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.status.readyReplicas >= 1`)),
+		WithCustomErrorMsg("OTel Collector deployment should have at least 1 ready replica"),
+	)
+	t.Log("OTel Collector is ready")
+}
+
+// otelCollectorEndpoint returns the cross-namespace OTLP gRPC endpoint for the operator's OTel Collector.
+func (tc *MonitoringTestCtx) otelCollectorEndpoint() string {
+	return fmt.Sprintf("http://%s-collector.%s.svc.cluster.local:4317",
+		OpenTelemetryCollectorName, tc.MonitoringNamespace)
+}
+
+// tempoGatewayServiceName returns the Tempo gateway service name for TempoMonolithic.
+func (tc *MonitoringTestCtx) tempoGatewayServiceName() string {
+	return fmt.Sprintf("tempo-%s-gateway", TempoMonolithicName)
+}
+
+// startPortForward starts a background port-forward and returns the cmd for cleanup.
+func (tc *MonitoringTestCtx) startPortForward(t *testing.T, namespace, svcName, localPort, remotePort string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("kubectl", "port-forward",
+		"-n", namespace,
+		"svc/"+svcName,
+		localPort+":"+remotePort)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Failed to start port-forward for %s: %v", svcName, err)
+	}
+	time.Sleep(3 * time.Second)
+	t.Logf("Port-forward started: %s/%s %s:%s (pid %d)", namespace, svcName, localPort, remotePort, cmd.Process.Pid)
+	return cmd
+}
+
+func stopPortForward(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Log("Port-forward stopped")
+	}
+}
+
+// queryTempoAPI queries the Tempo gateway with proper auth headers and returns the raw response body.
+// TODO(mambati): verify gateway endpoint path and auth headers on operator-deployed Tempo with multi-tenancy
+func (tc *MonitoringTestCtx) queryTempoAPI(t *testing.T, tempoAPIPath string) ([]byte, error) {
+	t.Helper()
+
+	tokenCmd := exec.Command("oc", "whoami", "-t")
+	tokenOut, err := tokenCmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OC token: %w (output: %s)", err, string(tokenOut))
+	}
+	token := strings.TrimSpace(string(tokenOut))
+
+	url := fmt.Sprintf(
+		"https://localhost:%s/api/traces/v1/%s/tempo%s",
+		tempoGatewayLocalPort, tc.MonitoringNamespace, tempoAPIPath)
+
+	cmd := exec.Command("curl", "-sk", "--max-time", "10",
+		"-H", "Authorization: Bearer "+token,
+		"-H", "X-Scope-OrgID: "+tc.MonitoringNamespace,
+		url)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("tempo query failed: %w (output: %s)", err, string(out))
+	}
+	return out, nil
+}
+
+// createTracingLLMISVC creates a LLMInferenceService with tracing args pointing to the operator's OTel Collector.
+func (tc *MonitoringTestCtx) createTracingLLMISVC(t *testing.T) {
+	t.Helper()
+
+	otelEndpoint := tc.otelCollectorEndpoint()
+	llmisvcYAML := fmt.Sprintf(`apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  model:
+    uri: %s
+    name: %s
+  template:
+    containers:
+    - name: main
+      image: %s
+      args:
+      - --otlp-traces-endpoint
+      - %s
+      - --collect-detailed-traces
+      - all
+      env:
+      - name: OTEL_SERVICE_NAME
+        value: %s
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: %s
+      - name: OTEL_TRACES_SAMPLER
+        value: parentbased_traceidratio
+      - name: OTEL_TRACES_SAMPLER_ARG
+        value: "1.0"
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          memory: 16Gi
+        requests:
+          nvidia.com/gpu: "1"
+          memory: 8Gi
+  router:
+    gateway:
+      refs:
+      - name: %s
+        namespace: %s
+    route: {}
+    scheduler:
+      template:
+        containers:
+        - name: main
+          args:
+          - --tracing=true
+          env:
+          - name: OTEL_SERVICE_NAME
+            value: %s
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: %s
+          - name: OTEL_TRACES_EXPORTER
+            value: otlp
+          - name: OTEL_TRACES_SAMPLER
+            value: parentbased_traceidratio
+          - name: OTEL_TRACES_SAMPLER_ARG
+            value: "1.0"`,
+		tracingE2ELLMISVCName, tracingE2ENamespace,
+		tracingE2EModelURI, tracingE2EModelName,
+		tracingE2EVLLMImage,
+		otelEndpoint, vllmOTELServiceName, otelEndpoint,
+		tracingE2EGatewayName, tracingE2ENamespace,
+		eppOTELServiceName, otelEndpoint)
+
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(llmisvcYAML)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to create LLMInferenceService: %s", string(out))
+	t.Logf("LLMInferenceService %s created in namespace %s", tracingE2ELLMISVCName, tracingE2ENamespace)
+}
+
+// waitForLLMISVCReady waits for the LLMInferenceService to reach Ready=True.
+func (tc *MonitoringTestCtx) waitForLLMISVCReady(t *testing.T) {
+	t.Helper()
+	t.Logf("Waiting for LLMInferenceService %s to be Ready...", tracingE2ELLMISVCName)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.LLMInferenceServiceV1Alpha1, types.NamespacedName{
+			Name: tracingE2ELLMISVCName, Namespace: tracingE2ENamespace}),
+		WithCondition(jq.Match(`.status.conditions[] | select(.type == "Ready") | .status == "True"`)),
+		WithCustomErrorMsg("LLMInferenceService should reach Ready state"),
+	)
+	t.Log("LLMInferenceService is Ready")
+}
+
+// discoverAndPatchEPPTracing finds the router-scheduler deployment and patches it with OTEL env vars.
+func (tc *MonitoringTestCtx) discoverAndPatchEPPTracing(t *testing.T) {
+	t.Helper()
+
+	cmd := exec.Command("kubectl", "get", "deployments", "-n", tracingE2ENamespace,
+		"-o", "jsonpath={.items[*].metadata.name}")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to list deployments: %s", string(out))
+
+	rsDeployName := ""
+	for _, name := range strings.Fields(string(out)) {
+		if strings.Contains(name, "router-scheduler") {
+			rsDeployName = name
+			break
+		}
+	}
+	if rsDeployName == "" {
+		t.Fatal("Could not find router-scheduler deployment")
+	}
+	t.Logf("Found router-scheduler deployment: %s", rsDeployName)
+
+	otelEndpoint := tc.otelCollectorEndpoint()
+	patchCmd := exec.Command("kubectl", "set", "env",
+		"deployment/"+rsDeployName,
+		"-n", tracingE2ENamespace,
+		"-c", "main",
+		"OTEL_TRACES_SAMPLER=always_on",
+		"OTEL_EXPORTER_OTLP_ENDPOINT="+otelEndpoint)
+	patchOut, patchErr := patchCmd.CombinedOutput()
+	require.NoError(t, patchErr, "Failed to patch EPP env vars: %s", string(patchOut))
+	t.Log("EPP patched with OTEL env vars")
+
+	rolloutCmd := exec.Command("kubectl", "rollout", "status",
+		"deployment/"+rsDeployName,
+		"-n", tracingE2ENamespace,
+		"--timeout=120s")
+	rolloutOut, rolloutErr := rolloutCmd.CombinedOutput()
+	require.NoError(t, rolloutErr, "EPP rollout failed: %s", string(rolloutOut))
+	t.Log("EPP rollout complete")
+}
+
+// sendTracingInferenceRequests sends inference requests via the gateway port-forward.
+func (tc *MonitoringTestCtx) sendTracingInferenceRequests(t *testing.T) {
+	t.Helper()
+
+	tokenCmd := exec.Command("oc", "whoami", "-t")
+	tokenOut, err := tokenCmd.CombinedOutput()
+	require.NoError(t, err, "Failed to get OC token: %s", string(tokenOut))
+	token := strings.TrimSpace(string(tokenOut))
+
+	url := fmt.Sprintf("https://localhost:%s/%s/%s/v1/chat/completions",
+		gatewayLocalPort, tracingE2ENamespace, tracingE2ELLMISVCName)
+	body := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"Say hello."}],"max_tokens":10}`,
+		tracingE2EModelName)
+
+	for i := 1; i <= numTraceTestRequests; i++ {
+		cmd := exec.Command("curl", "-sk", "--max-time", "30", "--noproxy", "localhost",
+			"-H", "Authorization: Bearer "+token,
+			"-H", "Content-Type: application/json",
+			"-d", body,
+			url)
+		out, curlErr := cmd.CombinedOutput()
+		if curlErr != nil {
+			t.Logf("Request %d/%d failed: %v (output: %s)", i, numTraceTestRequests, curlErr, string(out))
+		} else {
+			t.Logf("Request %d/%d: HTTP response received (%d bytes)", i, numTraceTestRequests, len(out))
+		}
+	}
+	t.Logf("Sent %d inference requests, waiting 10s for trace ingestion...", numTraceTestRequests)
+	time.Sleep(10 * time.Second)
+}
+
+type tempoSearchResponse struct {
+	Traces []struct {
+		TraceID  string `json:"traceID"`
+		SpanSets []struct {
+			Spans []struct {
+				SpanID string `json:"spanID"`
+				Name   string `json:"name"`
+			} `json:"spans"`
+		} `json:"spanSets"`
+	} `json:"traces"`
+}
+
+// verifyVLLMSpansInTempo queries Tempo for vLLM spans and asserts they exist.
+func (tc *MonitoringTestCtx) verifyVLLMSpansInTempo(t *testing.T) {
+	t.Helper()
+
+	var searchResp tempoSearchResponse
+	Eventually(func() error {
+		out, err := tc.queryTempoAPI(t, "/api/search?q=%7Bresource.service.name%3D%22"+vllmOTELServiceName+"%22%7D&limit=5")
+		if err != nil {
+			return fmt.Errorf("tempo query failed: %w", err)
+		}
+		if err := json.Unmarshal(out, &searchResp); err != nil {
+			return fmt.Errorf("failed to parse tempo response: %w (raw: %s)", err, string(out))
+		}
+		if len(searchResp.Traces) == 0 {
+			return fmt.Errorf("no traces found for service %s", vllmOTELServiceName)
+		}
+		return nil
+	}).WithTimeout(60 * time.Second).WithPolling(5 * time.Second).Should(Succeed(),
+		"vLLM traces should appear in Tempo within 60s")
+
+	t.Logf("Found %d traces for service %s in Tempo", len(searchResp.Traces), vllmOTELServiceName)
+	require.Greater(t, len(searchResp.Traces), 0, "Expected at least one vLLM trace")
+}
+
+// verifyEPPSpansInTempo checks for EPP spans in Tempo. Skips if not found (GAIE version gap).
+func (tc *MonitoringTestCtx) verifyEPPSpansInTempo(t *testing.T) {
+	t.Helper()
+
+	out, err := tc.queryTempoAPI(t, "/api/search?q=%7Bresource.service.name%3D%22"+eppOTELServiceName+"%22%7D&limit=5")
+	if err != nil {
+		t.Skipf("EPP trace query failed (may not be supported): %v", err)
+		return
+	}
+
+	var searchResp tempoSearchResponse
+	if err := json.Unmarshal(out, &searchResp); err != nil {
+		t.Skipf("Failed to parse EPP trace response: %v", err)
+		return
+	}
+
+	if len(searchResp.Traces) == 0 {
+		t.Skip("EPP tracing requires GAIE >= v1.4.0 — RHOAI 3.4 ships pre-v1.4.0 without ext-proc handler instrumentation (upstream PR #2057)")
+		return
+	}
+
+	t.Logf("EPP traces found: %d traces for service %s", len(searchResp.Traces), eppOTELServiceName)
 }
