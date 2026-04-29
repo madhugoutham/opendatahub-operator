@@ -67,8 +67,8 @@ const (
 	tracingE2ENamespace   = "e2e-tracing"
 	tracingE2ELLMISVCName = "tracing-test"
 	tracingE2EGatewayName = "e2e-tracing-gateway"
-	tracingE2EModelName   = "Qwen/Qwen3-0.6B"
-	tracingE2EModelURI    = "hf://Qwen/Qwen3-0.6B"
+	tracingE2EModelName = "Qwen/Qwen3-0.6B"
+	tracingE2EModelURI  = "hf://Qwen/Qwen3-0.6B"
 	vllmOTELServiceName   = "vllm-decode"
 	eppOTELServiceName    = "gateway-api-inference-extension/epp"
 	numTraceTestRequests  = 5
@@ -76,13 +76,22 @@ const (
 	gatewayLocalPort      = "18443"
 )
 
-// tracingVLLMImage returns the vLLM image to use for E2E tracing tests.
+// tracingVLLMImage returns the vLLM image for E2E tracing tests.
 // Override with E2E_TEST_VLLM_IMAGE for upstream or cluster-specific images.
 func tracingVLLMImage() string {
 	if img := os.Getenv("E2E_TEST_VLLM_IMAGE"); img != "" {
 		return img
 	}
 	return "quay.io/aipcc/rhaiis/cuda-ubi9:3.4.0"
+}
+
+// tracingModelURI returns the model URI for E2E tracing tests.
+// Override with E2E_TEST_MODEL_URI when HuggingFace access is unavailable.
+func tracingModelURI() string {
+	if uri := os.Getenv("E2E_TEST_MODEL_URI"); uri != "" {
+		return uri
+	}
+	return "hf://Qwen/Qwen3-0.6B"
 }
 
 // monitoringOwnerReferencesCondition is a reusable condition for validating owner references.
@@ -2502,7 +2511,7 @@ spec:
           - name: OTEL_TRACES_SAMPLER_ARG
             value: "1.0"`,
 		tracingE2ELLMISVCName, tracingE2ENamespace,
-		tracingE2EModelURI, tracingE2EModelName,
+		tracingModelURI(), tracingE2EModelName,
 		tracingVLLMImage(),
 		otelEndpoint, vllmOTELServiceName, otelEndpoint,
 		tracingE2EGatewayName, tracingE2ENamespace,
