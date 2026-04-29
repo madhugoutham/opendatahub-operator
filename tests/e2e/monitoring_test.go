@@ -2192,13 +2192,6 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceTLSWithGCSBackend(t *testin
 // ValidateE2ETraceFlowVerification deploys LLMInferenceService with tracing, sends inference
 // requests, and verifies vLLM spans appear in Tempo. Requires NVIDIA GPU.
 // INFERENG-5864
-//
-// TODO(mambati): The following need verification on a cluster with a healthy monitoring controller
-// (PokProd002's monitoring controller has a namespace cache error preventing operator-deployed Tempo):
-//   - queryTempoAPI() gateway auth (Bearer + X-Scope-OrgID) against operator-deployed Tempo with multi-tenancy
-//   - OTel Collector service name: code uses "data-science-collector-collector", may need adjustment
-//   - Tempo gateway service name: code uses "tempo-data-science-tempomonolithic-gateway", may differ
-//   - Pipeline was manually verified on PokProd002 using standalone Tempo (no multi-tenancy) — all traces flow correctly
 func (tc *MonitoringTestCtx) ValidateE2ETraceFlowVerification(t *testing.T) {
 	t.Helper()
 
@@ -2357,7 +2350,6 @@ func (tc *MonitoringTestCtx) clusterHasNVIDIAGPU(t *testing.T) bool {
 
 // waitForTracingPodsReady waits for both TempoMonolithic and OTel Collector to be ready.
 // setupTraces() returns before pods are running — this blocks until they're up.
-// TODO(mambati): verify deployment name "data-science-collector-collector" on operator-deployed cluster
 func (tc *MonitoringTestCtx) waitForTracingPodsReady(t *testing.T) {
 	t.Helper()
 	t.Log("Waiting for TempoMonolithic to be ready...")
@@ -2417,7 +2409,6 @@ func stopPortForward(t *testing.T, cmd *exec.Cmd) {
 }
 
 // queryTempoAPI queries the Tempo gateway with proper auth headers and returns the raw response body.
-// TODO(mambati): verify gateway endpoint path and auth headers on operator-deployed Tempo with multi-tenancy
 func (tc *MonitoringTestCtx) queryTempoAPI(t *testing.T, tempoAPIPath string) ([]byte, error) {
 	t.Helper()
 
