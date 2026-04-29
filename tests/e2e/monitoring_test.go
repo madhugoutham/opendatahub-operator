@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,11 +13,13 @@ import (
 	gTypes "github.com/onsi/gomega/types"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
@@ -62,18 +64,26 @@ const (
 	TracesStorageSize1Gi    = "1Gi"
 
 	// E2E Trace Flow Verification constants (Group 10).
-	tracingE2ENamespace    = "e2e-tracing"
-	tracingE2ELLMISVCName  = "tracing-test"
-	tracingE2EGatewayName  = "e2e-tracing-gateway"
-	tracingE2EModelName    = "Qwen/Qwen3-0.6B"
-	tracingE2EModelURI     = "hf://Qwen/Qwen3-0.6B"
-	tracingE2EVLLMImage    = "quay.io/aipcc/rhaiis/cuda-ubi9:3.4.0"
-	vllmOTELServiceName    = "vllm-decode"
-	eppOTELServiceName     = "gateway-api-inference-extension/epp"
-	numTraceTestRequests   = 5
-	tempoGatewayLocalPort  = "18080"
-	gatewayLocalPort       = "18443"
+	tracingE2ENamespace   = "e2e-tracing"
+	tracingE2ELLMISVCName = "tracing-test"
+	tracingE2EGatewayName = "e2e-tracing-gateway"
+	tracingE2EModelName   = "Qwen/Qwen3-0.6B"
+	tracingE2EModelURI    = "hf://Qwen/Qwen3-0.6B"
+	vllmOTELServiceName   = "vllm-decode"
+	eppOTELServiceName    = "gateway-api-inference-extension/epp"
+	numTraceTestRequests  = 5
+	tempoGatewayLocalPort = "18080"
+	gatewayLocalPort      = "18443"
 )
+
+// tracingVLLMImage returns the vLLM image to use for E2E tracing tests.
+// Override with E2E_TEST_VLLM_IMAGE for upstream or cluster-specific images.
+func tracingVLLMImage() string {
+	if img := os.Getenv("E2E_TEST_VLLM_IMAGE"); img != "" {
+		return img
+	}
+	return "quay.io/aipcc/rhaiis/cuda-ubi9:3.4.0"
+}
 
 // monitoringOwnerReferencesCondition is a reusable condition for validating owner references.
 var monitoringOwnerReferencesCondition = And(
@@ -2207,15 +2217,11 @@ func (tc *MonitoringTestCtx) ValidateE2ETraceFlowVerification(t *testing.T) {
 	tc.waitForTracingPodsReady(t)
 
 	// Create test namespace for LLMInferenceService
-	nsCmd := exec.Command("kubectl", "create", "ns", tracingE2ENamespace, "--dry-run=client", "-o", "yaml")
-	nsApplyCmd := exec.Command("kubectl", "apply", "-f", "-")
-	nsPipe, pipeErr := nsCmd.StdoutPipe()
-	require.NoError(t, pipeErr)
-	nsApplyCmd.Stdin = nsPipe
-	require.NoError(t, nsCmd.Start())
-	require.NoError(t, nsApplyCmd.Start())
-	_ = nsCmd.Wait()
-	require.NoError(t, nsApplyCmd.Wait(), "Failed to create tracing test namespace")
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: tracingE2ENamespace}}
+	err := tc.Client().Create(tc.Context(), ns)
+	if err != nil && !k8serr.IsAlreadyExists(err) {
+		require.NoError(t, err, "Failed to create tracing test namespace")
+	}
 	t.Logf("Namespace %s created", tracingE2ENamespace)
 
 	// Create Gateway + ConfigMap for inference routing
@@ -2273,16 +2279,16 @@ spec:
 	time.Sleep(10 * time.Second)
 
 	// Discover the gateway service created by the gateway controller
-	gwSvcCmd := exec.Command("kubectl", "get", "svc", "-n", tracingE2ENamespace,
-		"-l", "gateway.networking.k8s.io/gateway-name="+tracingE2EGatewayName,
-		"-o", "jsonpath={.items[0].metadata.name}")
-	gwSvcOut, gwSvcErr := gwSvcCmd.CombinedOutput()
-	gwSvcName := strings.TrimSpace(string(gwSvcOut))
-	if gwSvcErr != nil || gwSvcName == "" {
-		gwSvcName = tracingE2EGatewayName + "-data-science-gateway-class"
-		t.Logf("Gateway service discovery failed, using default: %s", gwSvcName)
-	} else {
+	gwSvcName := tracingE2EGatewayName + "-data-science-gateway-class"
+	svcList := &corev1.ServiceList{}
+	if listErr := tc.Client().List(tc.Context(), svcList,
+		client.InNamespace(tracingE2ENamespace),
+		client.MatchingLabels{"gateway.networking.k8s.io/gateway-name": tracingE2EGatewayName},
+	); listErr == nil && len(svcList.Items) > 0 {
+		gwSvcName = svcList.Items[0].Name
 		t.Logf("Discovered gateway service: %s", gwSvcName)
+	} else {
+		t.Logf("Gateway service discovery failed, using default: %s", gwSvcName)
 	}
 
 	// Start port-forwards
@@ -2296,8 +2302,9 @@ spec:
 	t.Cleanup(func() {
 		stopPortForward(t, tempoPF)
 		stopPortForward(t, gatewayPF)
-		delCmd := exec.Command("kubectl", "delete", "ns", tracingE2ENamespace, "--ignore-not-found=true")
-		delCmd.CombinedOutput() //nolint:errcheck // best-effort cleanup
+		_ = tc.Client().Delete(tc.Context(), &corev1.Namespace{ //nolint:errcheck // best-effort cleanup
+			ObjectMeta: metav1.ObjectMeta{Name: tracingE2ENamespace},
+		})
 		tc.cleanupTracesConfiguration()
 	})
 
@@ -2332,16 +2339,13 @@ spec:
 // clusterHasNVIDIAGPU checks if any node in the cluster has allocatable NVIDIA GPUs.
 func (tc *MonitoringTestCtx) clusterHasNVIDIAGPU(t *testing.T) bool {
 	t.Helper()
-	cmd := exec.Command("kubectl", "get", "nodes",
-		"-o", "jsonpath={.items[*].status.allocatable.nvidia\\.com/gpu}")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	nodeList := &corev1.NodeList{}
+	if err := tc.Client().List(tc.Context(), nodeList); err != nil {
 		t.Logf("GPU check failed: %v", err)
 		return false
 	}
-	for _, val := range strings.Fields(string(out)) {
-		n, parseErr := strconv.Atoi(val)
-		if parseErr == nil && n > 0 {
+	for _, node := range nodeList.Items {
+		if qty, ok := node.Status.Allocatable["nvidia.com/gpu"]; ok && qty.Value() > 0 {
 			return true
 		}
 	}
@@ -2499,7 +2503,7 @@ spec:
             value: "1.0"`,
 		tracingE2ELLMISVCName, tracingE2ENamespace,
 		tracingE2EModelURI, tracingE2EModelName,
-		tracingE2EVLLMImage,
+		tracingVLLMImage(),
 		otelEndpoint, vllmOTELServiceName, otelEndpoint,
 		tracingE2EGatewayName, tracingE2ENamespace,
 		eppOTELServiceName, otelEndpoint)
@@ -2529,15 +2533,15 @@ func (tc *MonitoringTestCtx) waitForLLMISVCReady(t *testing.T) {
 func (tc *MonitoringTestCtx) discoverAndPatchEPPTracing(t *testing.T) {
 	t.Helper()
 
-	cmd := exec.Command("kubectl", "get", "deployments", "-n", tracingE2ENamespace,
-		"-o", "jsonpath={.items[*].metadata.name}")
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "Failed to list deployments: %s", string(out))
+	deployList := &appsv1.DeploymentList{}
+	require.NoError(t, tc.Client().List(tc.Context(), deployList,
+		client.InNamespace(tracingE2ENamespace)),
+		"Failed to list deployments")
 
 	rsDeployName := ""
-	for _, name := range strings.Fields(string(out)) {
-		if strings.Contains(name, "router-scheduler") {
-			rsDeployName = name
+	for _, d := range deployList.Items {
+		if strings.Contains(d.Name, "router-scheduler") {
+			rsDeployName = d.Name
 			break
 		}
 	}
@@ -2547,22 +2551,22 @@ func (tc *MonitoringTestCtx) discoverAndPatchEPPTracing(t *testing.T) {
 	t.Logf("Found router-scheduler deployment: %s", rsDeployName)
 
 	otelEndpoint := tc.otelCollectorEndpoint()
-	patchCmd := exec.Command("kubectl", "set", "env",
-		"deployment/"+rsDeployName,
-		"-n", tracingE2ENamespace,
-		"-c", "main",
-		"OTEL_TRACES_SAMPLER=always_on",
-		"OTEL_EXPORTER_OTLP_ENDPOINT="+otelEndpoint)
-	patchOut, patchErr := patchCmd.CombinedOutput()
-	require.NoError(t, patchErr, "Failed to patch EPP env vars: %s", string(patchOut))
+	patch := fmt.Sprintf(`{"spec":{"template":{"spec":{"containers":[{"name":"main","env":[`+
+		`{"name":"OTEL_TRACES_SAMPLER","value":"always_on"},`+
+		`{"name":"OTEL_EXPORTER_OTLP_ENDPOINT","value":%q}`+
+		`]}]}}}}`, otelEndpoint)
+	require.NoError(t,
+		tc.Client().Patch(tc.Context(),
+			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: rsDeployName, Namespace: tracingE2ENamespace}},
+			client.RawPatch(types.StrategicMergePatchType, []byte(patch))),
+		"Failed to patch EPP env vars")
 	t.Log("EPP patched with OTEL env vars")
 
-	rolloutCmd := exec.Command("kubectl", "rollout", "status",
-		"deployment/"+rsDeployName,
-		"-n", tracingE2ENamespace,
-		"--timeout=120s")
-	rolloutOut, rolloutErr := rolloutCmd.CombinedOutput()
-	require.NoError(t, rolloutErr, "EPP rollout failed: %s", string(rolloutOut))
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{Name: rsDeployName, Namespace: tracingE2ENamespace}),
+		WithCondition(jq.Match(`.status.updatedReplicas == .status.replicas and .status.availableReplicas >= 1`)),
+		WithCustomErrorMsg("EPP deployment should finish rolling out"),
+	)
 	t.Log("EPP rollout complete")
 }
 
