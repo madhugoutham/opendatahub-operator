@@ -13,7 +13,6 @@ import (
 	gTypes "github.com/onsi/gomega/types"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	"github.com/stretchr/testify/require"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2328,11 +2327,6 @@ spec:
 		t.Fatal("LLMISVC not ready, stopping")
 	}
 
-	t.Run("Patch EPP with OTEL env vars", tc.discoverAndPatchEPPTracing)
-	if t.Failed() {
-		t.Fatal("EPP patching failed, stopping")
-	}
-
 	// Verification subtests
 	t.Run("Send inference requests", func(t *testing.T) {
 		tc.sendTracingInferenceRequests(t)
@@ -2536,47 +2530,6 @@ func (tc *MonitoringTestCtx) waitForLLMISVCReady(t *testing.T) {
 		WithCustomErrorMsg("LLMInferenceService should reach Ready state"),
 	)
 	t.Log("LLMInferenceService is Ready")
-}
-
-// discoverAndPatchEPPTracing finds the router-scheduler deployment and patches it with OTEL env vars.
-func (tc *MonitoringTestCtx) discoverAndPatchEPPTracing(t *testing.T) {
-	t.Helper()
-
-	deployList := &appsv1.DeploymentList{}
-	require.NoError(t, tc.Client().List(tc.Context(), deployList,
-		client.InNamespace(tracingE2ENamespace)),
-		"Failed to list deployments")
-
-	rsDeployName := ""
-	for _, d := range deployList.Items {
-		if strings.Contains(d.Name, "router-scheduler") {
-			rsDeployName = d.Name
-			break
-		}
-	}
-	if rsDeployName == "" {
-		t.Fatal("Could not find router-scheduler deployment")
-	}
-	t.Logf("Found router-scheduler deployment: %s", rsDeployName)
-
-	otelEndpoint := tc.otelCollectorEndpoint()
-	patch := fmt.Sprintf(`{"spec":{"template":{"spec":{"containers":[{"name":"main","env":[`+
-		`{"name":"OTEL_TRACES_SAMPLER","value":"always_on"},`+
-		`{"name":"OTEL_EXPORTER_OTLP_ENDPOINT","value":%q}`+
-		`]}]}}}}`, otelEndpoint)
-	require.NoError(t,
-		tc.Client().Patch(tc.Context(),
-			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: rsDeployName, Namespace: tracingE2ENamespace}},
-			client.RawPatch(types.StrategicMergePatchType, []byte(patch))),
-		"Failed to patch EPP env vars")
-	t.Log("EPP patched with OTEL env vars")
-
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Deployment, types.NamespacedName{Name: rsDeployName, Namespace: tracingE2ENamespace}),
-		WithCondition(jq.Match(`.status.updatedReplicas == .status.replicas and .status.availableReplicas >= 1`)),
-		WithCustomErrorMsg("EPP deployment should finish rolling out"),
-	)
-	t.Log("EPP rollout complete")
 }
 
 // sendTracingInferenceRequests sends inference requests via the gateway port-forward.
