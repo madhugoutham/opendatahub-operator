@@ -249,7 +249,7 @@ The flag lives in the `ingress` section of the `inferenceservice-config` ConfigM
 
 | Key | Type | Default | Effect |
 |-----|------|---------|--------|
-| `enableLLMInferenceServiceTLS` | boolean | `true` (when key is absent, Go zero-value `false` is not used because the field has `omitempty` and the controller reads from `IngressConfig` which defaults to `true`) | When `false`, disables built-in TLS for all LLMInferenceService deployments |
+| `enableLLMInferenceServiceTLS` | boolean | `true` (set explicitly by the RHOAI/ODH ConfigMap overlay at `config/overlays/odh/`, not a Go default. If the key is absent, Go unmarshals as `false`.) | When `false`, disables built-in TLS for all LLMInferenceService deployments |
 
 ### Kserve CR field
 
