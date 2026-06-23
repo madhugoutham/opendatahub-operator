@@ -5,10 +5,12 @@ In some environments, TLS between the inference gateway and model servers is han
 When you disable TLS, the llmisvc controller automatically adjusts the following behaviors:
 
 - Health and readiness probes switch from HTTPS to HTTP.
-- The Endpoint Picker (EPP) inference scheduler runs without the `--secure-serving` flag.
+- The Endpoint Picker (EPP) inference scheduler runs with `--secure-serving=false` and stops passing `--cert-path`, `--enable-cert-reload`, and `--model-server-metrics-scheme=https`.
+- In disaggregated (prefill/decode) deployments, the routing proxy runs with `--secure-proxy=false` and stops passing `--decoder-use-tls` and `--prefiller-use-tls`.
 - Istio DestinationRules for TLS origination are deleted (if they exist).
 - The workload service port name changes from `https` to `http`.
 - The LLMInferenceService status URL uses the `http://` scheme.
+- vLLM SSL arguments (`--enable-ssl-refresh`, `--ssl-certfile`, `--ssl-keyfile`) are not injected into the container command.
 
 Self-signed TLS certificates are still generated regardless of this setting. This is by design and does not affect the behavior of the deployment when TLS is disabled.
 
@@ -189,7 +191,25 @@ Expected output (the URL should start with `http://`, not `https://`):
 http://sample-llm-inference-service-kserve-workload-svc.my-namespace.svc.cluster.local
 ```
 
-### 5. Send a test inference request
+### 5. Check EPP scheduler flags
+
+Verify that the EPP scheduler is running with `--secure-serving=false`:
+
+```bash
+oc get deployment -l app.kubernetes.io/component=scheduler \
+  -n my-namespace \
+  -o jsonpath='{.items[0].spec.template.spec.containers[0].args}' | tr ',' '\n' | grep secure
+```
+
+Expected output:
+
+```text
+--secure-serving=false
+```
+
+You should NOT see `--enable-cert-reload=true`, `--model-server-metrics-scheme=https`, or `--cert-path=/var/run/kserve/tls` in the args.
+
+### 6. Send a test inference request
 
 Verify that the model server responds to an HTTP request:
 
@@ -223,45 +243,65 @@ For Kserve CR method: remove the `enableLLMInferenceServiceTLS` field from the K
 
 ## Technical Reference
 
-This section is for documentation writers who need to update the customer-facing docs.
-
 ### ConfigMap key
 
 The flag lives in the `ingress` section of the `inferenceservice-config` ConfigMap in the controller namespace (`redhat-ods-applications`).
 
 | Key | Type | Default | Effect |
 |-----|------|---------|--------|
-| `enableLLMInferenceServiceTLS` | boolean | `true` (when absent) | When `false`, disables built-in TLS for all LLMInferenceService deployments |
+| `enableLLMInferenceServiceTLS` | boolean | `true` (when key is absent, Go zero-value `false` is not used because the field has `omitempty` and the controller reads from `IngressConfig` which defaults to `true`) | When `false`, disables built-in TLS for all LLMInferenceService deployments |
 
 ### Kserve CR field
 
 | Field | Type | Path | Effect |
 |-------|------|------|--------|
-| `enableLLMInferenceServiceTLS` | `*bool` | `spec.enableLLMInferenceServiceTLS` | When set to `false`, the kserve-module operator writes the value into the ConfigMap. When unset, the KServe default (TLS enabled) is preserved. |
+| `enableLLMInferenceServiceTLS` | `*bool` (pointer to bool) | `spec.enableLLMInferenceServiceTLS` | When set to `false`, the kserve-module operator writes the value into the ConfigMap. When unset (nil), the KServe default (TLS enabled) is preserved. Uses `*bool` so that "not set" and "set to false" are distinguishable. |
 
 ### What changes when TLS is disabled
 
 | Component | TLS enabled (default) | TLS disabled |
 |-----------|----------------------|--------------|
 | Probe scheme | HTTPS | HTTP |
-| EPP scheduler | `--secure-serving` flag present | `--secure-serving` flag absent |
+| EPP `--secure-serving` | `--secure-serving=true` | `--secure-serving=false` |
+| EPP `--enable-cert-reload` | `--enable-cert-reload=true` | Not rendered (absent) |
+| EPP `--model-server-metrics-scheme` | `--model-server-metrics-scheme=https` | Not rendered (absent) |
+| EPP `--cert-path` | `--cert-path=/var/run/kserve/tls` | Not rendered (absent) |
+| P/D proxy `--secure-proxy` | `--secure-proxy=true` | `--secure-proxy=false` |
+| P/D proxy `--decoder-use-tls` | `--decoder-use-tls=true` | Not rendered (absent) |
+| P/D proxy `--prefiller-use-tls` | `--prefiller-use-tls=true` | Not rendered (absent) |
+| vLLM `--enable-ssl-refresh` | Rendered | Not rendered (absent) |
+| vLLM `--ssl-certfile` | `--ssl-certfile /var/run/kserve/tls/tls.crt` | Not rendered (absent) |
+| vLLM `--ssl-keyfile` | `--ssl-keyfile /var/run/kserve/tls/tls.key` | Not rendered (absent) |
 | Workload service port name | `https` | `http` |
 | DestinationRules (Istio) | Created for TLS origination | Deleted |
 | Status URL scheme | `https://` | `http://` |
 | Self-signed certs | Generated | Still generated (no change) |
-| vLLM SSL args | `--enable-ssl-refresh`, `--ssl-certfile`, `--ssl-keyfile` applied by template | Not applied by template |
 
-### Sections in the 3.4 docs that need updating for 3.5
+### Template files that gate on `.GlobalConfig.EnableTLS`
 
-1. **Chapter 1, Section 1.1 "Enabling Distributed Inference with llm-d"**: Add a note that TLS can be disabled via ConfigMap for environments using Istio mTLS.
+These are the LLMInferenceServiceConfig template files in `config/llmisvcconfig/` that render differently when TLS is disabled:
 
-2. **vLLM arguments reference (Chapter 5)**: The comment "Remove the following three lines if your deployment does not use TLS" should reference the ConfigMap toggle. When TLS is disabled via the flag, these arguments are not injected automatically.
+| Template file | What it gates |
+|--------------|---------------|
+| `config-llm-template.yaml` | vLLM SSL args, probe schemes |
+| `config-llm-decode-template.yaml` | vLLM SSL args, probe schemes, proxy TLS flags |
+| `config-llm-prefill-template.yaml` | vLLM SSL args, probe schemes |
+| `config-llm-scheduler.yaml` | EPP `--secure-serving`, `--enable-cert-reload`, `--model-server-metrics-scheme`, `--cert-path` |
+| `config-llm-decode-worker-data-parallel.yaml` | vLLM SSL args, probe schemes, proxy TLS flags |
+| `config-llm-prefill-worker-data-parallel.yaml` | vLLM SSL args, probe schemes |
+| `config-llm-worker-data-parallel.yaml` | vLLM SSL args, probe schemes |
 
-3. **Autoscaling example (Chapter 7)**: The TLS gateway and `serving-cert-secret-name` examples should note that these are only relevant when TLS is enabled.
+### Controller code paths affected
 
-4. **Probe configuration notes**: Update the note about HTTPS probe scheme to explain that when TLS is disabled, probes use HTTP automatically.
-
-5. **New section recommended**: "Disabling TLS for LLMInferenceService deployments" as a standalone section, covering when to use it, how to configure it, and how to verify.
+| File | What it does |
+|------|-------------|
+| `pkg/apis/serving/v1beta1/configmap.go:128` | Defines `EnableLLMInferenceServiceTLS` field on `IngressConfig` struct |
+| `pkg/controller/v1alpha2/llmisvc/config_loader.go:172` | Maps `IngressConfig.EnableLLMInferenceServiceTLS` to `Config.EnableTLS` |
+| `pkg/controller/v1alpha2/llmisvc/workload.go:114` | Gates service port name (`https` vs `http`) |
+| `pkg/controller/v1alpha2/llmisvc/router.go:323` | Gates status URL scheme (`HTTPS` vs `HTTP`) |
+| `pkg/controller/v1alpha2/llmisvc/router_platform_networking_odh.go:122` | Decides whether to create or delete DestinationRules |
+| `kserve-module/pkg/apis/v1alpha1/types.go:68` | Defines `*bool` field on Kserve CR spec |
+| `kserve-module/pkg/kservemodule/configmap.go:71-72` | Propagates CR field value into ConfigMap |
 
 ### Source PRs
 
@@ -269,7 +309,7 @@ The flag lives in the `ingress` section of the `inferenceservice-config` ConfigM
 |----|------------|-------------|
 | [#5525](https://github.com/kserve/kserve/pull/5525) | kserve/kserve | Upstream: wire enableLLMInferenceServiceTLS through reconcile pipeline |
 | [#1595](https://github.com/opendatahub-io/kserve/pull/1595) | opendatahub-io/kserve | Midstream: gate TLS resources on enableLLMInferenceServiceTLS |
-| [#1622](https://github.com/opendatahub-io/kserve/pull/1622) | opendatahub-io/kserve | kserve-module: add EnableLLMInferenceServiceTLS toggle |
+| [#1622](https://github.com/opendatahub-io/kserve/pull/1622) | opendatahub-io/kserve | kserve-module: add EnableLLMInferenceServiceTLS toggle to Kserve CR |
 
 ### Jira tickets
 
